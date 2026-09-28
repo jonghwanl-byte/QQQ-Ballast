@@ -1,0 +1,47 @@
+name: Ballast Daily Signal
+
+on:
+  schedule:
+    # UTC 21:30 (일~금) = 한국시간 06:30 (월~토)
+    - cron: "30 21 * * 0-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "텔레그램 발송 없이 로그로만 확인 (테스트용)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ballast-signal
+  cancel-in-progress: false
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 코드 내려받기
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 라이브러리 설치
+        run: pip install -r requirements.txt
+
+      - name: 신호 계산 및 텔레그램 발송
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          ARGS=""
+          # 수동 실행은 월요일/휴장 안내 로직 없이 항상 전체 메시지를 생성
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then ARGS="--force"; fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          python ballast_signal.py $ARGS

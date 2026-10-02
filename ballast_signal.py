@@ -55,34 +55,76 @@ def load_from_csv(csv_dir: str) -> dict:
     return out
 
 
+def _trim_incomplete_bar(df: pd.DataFrame, now_et: datetime) -> pd.DataFrame:
+    """장중에 받아온 오늘자 미완성 봉 제거 (ET 기준 오늘 날짜 + 마감 전이면 마지막 행 삭제)."""
+    if len(df) and df["Date"].iloc[-1].date() == now_et.date() and not session_closed_today(now_et):
+        return df.iloc[:-1].reset_index(drop=True)
+    return df
+
+
+def fetch_one_yahoo(ticker: str, now_et: datetime) -> pd.DataFrame:
+    import yfinance as yf
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = yf.download(ticker, start=HIST_START[ticker], auto_adjust=True, progress=False)
+            if df is None or df.empty:
+                raise RuntimeError("빈 데이터")
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.reset_index()
+            df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
+            df = df[["Date", "Open", "High", "Low", "Close"]].dropna().sort_values("Date").reset_index(drop=True)
+            return _trim_incomplete_bar(df, now_et)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            time.sleep(5 * (attempt + 1))
+    raise RuntimeError(f"yahoo 다운로드 실패: {last_err}")
+
+
+def fetch_one_stooq(ticker: str) -> pd.DataFrame:
+    """야후가 지연될 때 쓰는 보조 소스. 보통 야후보다 장마감 후 더 빨리 갱신됨."""
+    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
+    df = pd.read_csv(url, parse_dates=["Date"])
+    if df is None or df.empty or "Close" not in df.columns:
+        raise RuntimeError("빈 데이터 또는 형식 오류")
+    df = df[["Date", "Open", "High", "Low", "Close"]].dropna().sort_values("Date").reset_index(drop=True)
+    return df
+
+
 def load_from_yahoo() -> dict:
-    import yfinance as yf  # 지연 import (CSV 모드에서는 불필요)
-    out = {}
-    for a in ASSETS:
-        last_err = None
-        for attempt in range(3):
-            try:
-                df = yf.download(a, start=HIST_START[a], auto_adjust=True, progress=False)
-                if df is None or df.empty:
-                    raise RuntimeError("빈 데이터")
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                df = df.reset_index()
-                df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
-                df = df[["Date", "Open", "High", "Low", "Close"]].dropna().sort_values("Date").reset_index(drop=True)
-                out[a] = df
-                break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                time.sleep(5 * (attempt + 1))
-        else:
-            raise RuntimeError(f"{a} 데이터 다운로드 실패: {last_err}")
-    # 장중 미완성 봉 제거 (ET 기준 오늘 날짜 + 마감 전이면 마지막 행 삭제)
+    """자산별로 야후 -> (지연 시) stooq 순으로 시도하고, 어느 자산이 지연됐는지 로그에 남긴다."""
     now_et = datetime.now(ET)
+    exp = expected_session(now_et)
+    out = {}
+    status = []
     for a in ASSETS:
-        df = out[a]
-        if df["Date"].iloc[-1].date() == now_et.date() and not session_closed_today(now_et):
-            out[a] = df.iloc[:-1].reset_index(drop=True)
+        df, src = None, None
+        try:
+            df = fetch_one_yahoo(a, now_et)
+            src = "yahoo"
+        except Exception as e:  # noqa: BLE001
+            print(f"[{a}] yahoo 실패: {e}", file=sys.stderr)
+
+        last = df["Date"].iloc[-1].date() if df is not None and len(df) else None
+        if df is None or last is None or last < exp:
+            try:
+                df2 = fetch_one_stooq(a)
+                last2 = df2["Date"].iloc[-1].date() if len(df2) else None
+                if df is None or (last2 is not None and (last is None or last2 > last)):
+                    df, src, last = df2, "stooq", last2
+            except Exception as e:  # noqa: BLE001
+                print(f"[{a}] stooq 실패: {e}", file=sys.stderr)
+
+        if df is None or not len(df):
+            raise RuntimeError(f"{a} 데이터를 야후/stooq 양쪽에서 모두 가져오지 못했습니다")
+        out[a] = df
+        status.append(f"{a}={last}({src})")
+
+    print(f"예상 세션 {exp} | 자산별 최신 데이터: " + ", ".join(status))
+    stale = [s for s in status if str(exp) not in s]
+    if stale:
+        print(f"⚠️ 예상 세션({exp})보다 오래된 자산: {', '.join(stale)}", file=sys.stderr)
     return out
 
 
@@ -477,15 +519,17 @@ def main():
         else:
             data = load_from_yahoo()
             m = build_frame(data)
-            # 마감 직후라 야후 데이터가 늦게 반영될 수 있어, 최신 세션이 안 보이면 최대 3회(5분 간격) 재시도
+            # 마감 직후라 데이터가 늦게 반영될 수 있어, 최신 세션이 안 보이면 최대 4회(5분 간격) 재시도
             now0 = datetime.now(KST)
-            if not args.force and not args.check and now0.weekday() != 0:
-                for _ in range(3):
+            if not args.force and not args.check:
+                for i in range(4):
                     if m["Date"].iloc[-1].date() >= expected_session(now0.astimezone(ET)):
                         break
+                    print(f"재시도 {i + 1}/4 ...")
                     time.sleep(300)
                     data = load_from_yahoo()
                     m = build_frame(data)
+                    now0 = datetime.now(KST)
         if args.check:
             check_backtest(m)
             return

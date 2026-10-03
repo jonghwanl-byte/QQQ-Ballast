@@ -21,7 +21,7 @@ import os
 import sys
 import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -46,17 +46,18 @@ ET = ZoneInfo("America/New_York")
 
 
 # ---------------------- 데이터 로드 ----------------------
-def load_from_csv(csv_dir: str) -> dict:
+def load_from_csv(csv_dir: str):
     out = {}
     for a in ASSETS:
         df = pd.read_csv(os.path.join(csv_dir, f"{a.lower()}_us_d.csv"), parse_dates=["Date"])
         df.columns = [c.strip() for c in df.columns]
         out[a] = df[["Date", "Open", "High", "Low", "Close"]].sort_values("Date").reset_index(drop=True)
-    return out
+    dates = {a: out[a]["Date"].iloc[-1].date() for a in ASSETS}
+    return out, dates
 
 
 def _trim_incomplete_bar(df: pd.DataFrame, now_et: datetime) -> pd.DataFrame:
-    """장중에 받아온 오늘자 미완성 봉 제거 (ET 기준 오늘 날짜 + 마감 전이면 마지막 행 삭제)."""
+    """장중에 받아온 오늘자 미완성 봉 제거 (ET 기준 오늘 날짜 + 아직 장중이면 마지막 행 삭제)."""
     if len(df) and df["Date"].iloc[-1].date() == now_et.date() and not session_closed_today(now_et):
         return df.iloc[:-1].reset_index(drop=True)
     return df
@@ -83,49 +84,69 @@ def fetch_one_yahoo(ticker: str, now_et: datetime) -> pd.DataFrame:
 
 
 def fetch_one_stooq(ticker: str) -> pd.DataFrame:
-    """야후가 지연될 때 쓰는 보조 소스. 보통 야후보다 장마감 후 더 빨리 갱신됨."""
+    """야후가 뒤처질 때 쓰는 보조 소스.
+    stooq는 브라우저 User-Agent가 없는 요청(기본 urllib/pandas)을 404로 차단하므로 requests로 헤더를 붙여 호출."""
+    import io
+    import requests
     url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
-    df = pd.read_csv(url, parse_dates=["Date"])
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; qqq-ballast/1.0)"}, timeout=20)
+    resp.raise_for_status()
+    if "Date" not in resp.text[:50]:
+        raise RuntimeError(f"예상치 못한 응답: {resp.text[:80]!r}")
+    df = pd.read_csv(io.StringIO(resp.text), parse_dates=["Date"])
     if df is None or df.empty or "Close" not in df.columns:
         raise RuntimeError("빈 데이터 또는 형식 오류")
     df = df[["Date", "Open", "High", "Low", "Close"]].dropna().sort_values("Date").reset_index(drop=True)
     return df
 
 
-def load_from_yahoo() -> dict:
-    """자산별로 야후 -> (지연 시) stooq 순으로 시도하고, 어느 자산이 지연됐는지 로그에 남긴다."""
-    now_et = datetime.now(ET)
-    exp = expected_session(now_et)
-    out = {}
-    status = []
-    for a in ASSETS:
-        df, src = None, None
-        try:
-            df = fetch_one_yahoo(a, now_et)
-            src = "yahoo"
-        except Exception as e:  # noqa: BLE001
-            print(f"[{a}] yahoo 실패: {e}", file=sys.stderr)
+def fetch_best(ticker: str, now_et: datetime):
+    """야후·stooq 둘 다 시도해서 '더 최신 날짜'인 쪽을 채택한다.
+    (야후가 에러 없이 응답했다는 것과 '최신'이라는 것은 별개 — 에러 없이 성공해도
+    하루 뒤처진 데이터를 줄 수 있어, 한쪽만 보고 "성공했으니 끝"이라 판단하면 안 된다.)
+    동률이면 야후를 우선한다(데이터 포맷이 기존과 더 일치)."""
+    candidates = []
+    try:
+        candidates.append(("yahoo", fetch_one_yahoo(ticker, now_et)))
+    except Exception as e:  # noqa: BLE001
+        print(f"[{ticker}] yahoo 실패: {e}", file=sys.stderr)
+    try:
+        candidates.append(("stooq", fetch_one_stooq(ticker)))
+    except Exception as e:  # noqa: BLE001
+        print(f"[{ticker}] stooq 실패: {e}", file=sys.stderr)
+    if not candidates:
+        raise RuntimeError(f"{ticker} 데이터를 야후/stooq 양쪽에서 모두 가져오지 못했습니다")
+    candidates.sort(key=lambda c: c[1]["Date"].iloc[-1], reverse=True)  # 최신 날짜 우선, 동률시 yahoo
+    src, df = candidates[0]
+    return df, src
 
-        last = df["Date"].iloc[-1].date() if df is not None and len(df) else None
-        if df is None or last is None or last < exp:
-            try:
-                df2 = fetch_one_stooq(a)
-                last2 = df2["Date"].iloc[-1].date() if len(df2) else None
-                if df is None or (last2 is not None and (last is None or last2 > last)):
-                    df, src, last = df2, "stooq", last2
-            except Exception as e:  # noqa: BLE001
-                print(f"[{a}] stooq 실패: {e}", file=sys.stderr)
 
-        if df is None or not len(df):
-            raise RuntimeError(f"{a} 데이터를 야후/stooq 양쪽에서 모두 가져오지 못했습니다")
-        out[a] = df
-        status.append(f"{a}={last}({src})")
+def load_from_yahoo(max_rounds: int = 3) -> dict:
+    """자산별로 야후·stooq 중 더 최신인 쪽을 채택한다(fetch_best).
+    "지금 몇 시니까 며칠 데이터가 있어야 한다"는 시계 기준 추측은 하지 않는다 — 두 소스 중
+    실제로 더 최신인 데이터를 그대로 신뢰한다. 그래도 4개 자산끼리 최신 날짜가 서로 다르면
+    (= 특정 자산만 아직 안 올라옴) 최대 max_rounds회, 5분 간격으로 전체를 다시 조회해 맞춘다.
+    끝까지 안 맞으면 경고만 남기고 공통 날짜(merge가 자동으로 더 뒤처진 자산에 맞춤)로 진행한다."""
+    out, src_of, dates = {}, {}, {}
 
-    print(f"예상 세션 {exp} | 자산별 최신 데이터: " + ", ".join(status))
-    stale = [s for s in status if str(exp) not in s]
-    if stale:
-        print(f"⚠️ 예상 세션({exp})보다 오래된 자산: {', '.join(stale)}", file=sys.stderr)
-    return out
+    def fetch_round():
+        now_et = datetime.now(ET)
+        for a in ASSETS:
+            out[a], src_of[a] = fetch_best(a, now_et)
+            dates[a] = out[a]["Date"].iloc[-1].date()
+
+    fetch_round()
+    for rnd in range(max_rounds):
+        if len(set(dates.values())) <= 1:
+            break
+        print(f"자산별 최신일 불일치(라운드 {rnd + 1}/{max_rounds}): "
+              + ", ".join(f"{a}={dates[a]}" for a in ASSETS))
+        if rnd < max_rounds - 1:
+            time.sleep(300)
+            fetch_round()
+
+    print("자산별 최신 데이터: " + ", ".join(f"{a}={dates[a]}({src_of[a]})" for a in ASSETS))
+    return out, dates
 
 
 # ---------------------- 공통 지표: DI/ADX (EWM) ----------------------
@@ -401,23 +422,14 @@ def vol_reference(m):
     return float(np.std(r[-VOL_WINDOW:], ddof=1) * np.sqrt(252))
 
 
-def build_message(m, now_kst: datetime, force: bool = False, now_et: datetime = None) -> str:
+def build_message(m, now_kst: datetime, date_mismatch: str = "") -> str:
+    """now_kst는 표시용(토·월요일 안내 문구 분기)일 뿐, 데이터 최신성 판정에는 쓰지 않는다 —
+    "지금 몇 시니까 며칠 데이터가 있어야 한다"는 시계 기준 추측이 과거에 반복된 오탐의 원인이었음.
+    대신 load_from_yahoo()가 자산 간 날짜 불일치를 이미 해소하려 시도했고, 그래도 안 맞으면
+    date_mismatch에 그 사실만 경고로 받아 표시한다."""
     w = target_weights(m)
     bar_date = m["Date"].iloc[-1].date()
     title = f"📊 QQQ Ballast 신호 — {bar_date} 종가 기준"
-
-    # 휴장/데이터 미갱신 감지
-    if now_et is not None and not force:
-        exp = expected_session(now_et)
-        if bar_date < exp:
-            return "\n".join([
-                f"📊 QQQ Ballast — {now_kst.strftime('%Y-%m-%d')}",
-                f"⚠️ 미국장 휴장이거나 데이터가 아직 갱신되지 않았습니다. (마지막 데이터 {bar_date}, 예상 {exp})",
-                "신호 변동 없음으로 간주하고 직전 비중을 유지하세요.",
-                "데이터 지연이 의심되면 GitHub Actions에서 수동 재실행(Run workflow) 하세요.",
-                "",
-                build_weight_block(m, w, mode="hold"),
-            ])
 
     trades, verbs = build_trades(m, w)
     if trades:
@@ -426,8 +438,10 @@ def build_message(m, now_kst: datetime, force: bool = False, now_et: datetime = 
     else:
         summary = "변동 없음, 전 포지션 유지"
 
-    out = [title, f"한줄요약: {summary}", "", build_weight_block(m, w), "", "──────────────",
-           "💰 오늘 실행할 매매"]
+    out = [title, f"한줄요약: {summary}"]
+    if date_mismatch:
+        out.append(f"⚠️ {date_mismatch}")
+    out += ["", build_weight_block(m, w), "", "──────────────", "💰 오늘 실행할 매매"]
     if trades:
         out += [f"{k}. {t}" for k, t in enumerate(trades, 1)]
         if now_kst.weekday() in (5, 0):  # 토요일 / 월요일 발송분(금요일 종가 기준)
@@ -446,18 +460,9 @@ def build_message(m, now_kst: datetime, force: bool = False, now_et: datetime = 
 
 
 def session_closed_today(now_et: datetime) -> bool:
-    """미국 정규장 마감(16:00 ET) 후 15분이 지났으면 오늘 세션 종가가 확정된 것으로 본다."""
-    return (now_et.hour, now_et.minute) >= (16, 15)
-
-
-def expected_session(now_et: datetime):
-    """지금 시점에서 종가가 확정되어 있어야 하는 가장 최근 미국 평일 세션 날짜."""
-    d = now_et.date()
-    if not session_closed_today(now_et):
-        d -= timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
+    """미국 정규장 마감(16:00 ET) 후 1시간 30분이 지났으면 오늘 세션 종가가 확정된 것으로 본다.
+    데이터 제공처(야후/stooq)가 마감 직후 바로 일봉을 올리지 않는 경우가 있어 여유를 둠."""
+    return (now_et.hour, now_et.minute) >= (17, 30)
 
 
 # ---------------------- 텔레그램 ----------------------
@@ -507,38 +512,31 @@ def main():
     ap.add_argument("--source", choices=["yahoo", "csv"], default="yahoo")
     ap.add_argument("--csv-dir", default=".")
     ap.add_argument("--dry-run", action="store_true", help="발송하지 않고 화면에만 출력")
-    ap.add_argument("--force", action="store_true", help="월요일/휴장 안내 로직을 무시하고 전체 메시지 생성")
+    ap.add_argument("--force", action="store_true", help="(호환용, 현재는 동작에 영향 없음)")
     ap.add_argument("--check", action="store_true", help="백테스트 성과 재현 검증만 실행")
     ap.add_argument("--now-kst", default=None, help="테스트용 가짜 현재시각 (예: 2026-09-30T06:30)")
     args = ap.parse_args()
 
     try:
         if args.source == "csv":
-            data = load_from_csv(args.csv_dir)
-            m = build_frame(data)
+            data, dates = load_from_csv(args.csv_dir)
         else:
-            data = load_from_yahoo()
-            m = build_frame(data)
-            # 마감 직후라 데이터가 늦게 반영될 수 있어, 최신 세션이 안 보이면 최대 4회(5분 간격) 재시도
-            now0 = datetime.now(KST)
-            if not args.force and not args.check:
-                for i in range(4):
-                    if m["Date"].iloc[-1].date() >= expected_session(now0.astimezone(ET)):
-                        break
-                    print(f"재시도 {i + 1}/4 ...")
-                    time.sleep(300)
-                    data = load_from_yahoo()
-                    m = build_frame(data)
-                    now0 = datetime.now(KST)
+            data, dates = load_from_yahoo()
+        m = build_frame(data)
+
         if args.check:
             check_backtest(m)
             return
+
+        date_mismatch = ""
+        if len(set(dates.values())) > 1:
+            date_mismatch = "자산별 데이터 기준일 불일치: " + ", ".join(f"{a} {d}" for a, d in dates.items())
+
         if args.now_kst:
             now_kst = datetime.fromisoformat(args.now_kst).replace(tzinfo=KST)
         else:
             now_kst = datetime.now(KST)
-        now_et = now_kst.astimezone(ET) if args.source == "yahoo" else None
-        msg = build_message(m, now_kst, force=args.force, now_et=now_et)
+        msg = build_message(m, now_kst, date_mismatch=date_mismatch)
         if args.dry_run:
             print(msg)
         else:

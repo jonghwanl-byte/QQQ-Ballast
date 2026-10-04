@@ -2,8 +2,8 @@ name: Ballast Daily Signal
 
 on:
   schedule:
-    # UTC 21:30 (일~금) = 한국시간 06:30 (월~토)
-    - cron: "30 21 * * 0-5"
+    # UTC 21:42 (일~금) = 한국시간 06:42 (월~토)
+    - cron: "42 21 * * 0-5"
   workflow_dispatch:
     inputs:
       dry_run:

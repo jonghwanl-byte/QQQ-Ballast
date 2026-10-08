@@ -63,70 +63,88 @@ def _trim_incomplete_bar(df: pd.DataFrame, now_et: datetime) -> pd.DataFrame:
     return df
 
 
-def fetch_one_yahoo(ticker: str, now_et: datetime) -> pd.DataFrame:
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.reset_index()
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
+    return df[["Date", "Open", "High", "Low", "Close"]].dropna().sort_values("Date").reset_index(drop=True)
+
+
+def _y_download(ticker, end):
     import yfinance as yf
-    last_err = None
-    for attempt in range(3):
-        try:
-            df = yf.download(ticker, start=HIST_START[ticker], auto_adjust=True, progress=False)
-            if df is None or df.empty:
-                raise RuntimeError("빈 데이터")
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df.reset_index()
-            df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
-            df = df[["Date", "Open", "High", "Low", "Close"]].dropna().sort_values("Date").reset_index(drop=True)
-            return _trim_incomplete_bar(df, now_et)
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            time.sleep(5 * (attempt + 1))
-    raise RuntimeError(f"yahoo 다운로드 실패: {last_err}")
+    return _clean(yf.download(ticker, start=HIST_START[ticker], end=end, auto_adjust=True, progress=False))
 
 
-def fetch_one_stooq(ticker: str) -> pd.DataFrame:
-    """야후가 뒤처질 때 쓰는 보조 소스.
-    stooq는 브라우저 User-Agent가 없는 요청(기본 urllib/pandas)을 404로 차단하므로 requests로 헤더를 붙여 호출."""
-    import io
+def _y_history(ticker, end):
+    import yfinance as yf
+    return _clean(yf.Ticker(ticker).history(start=HIST_START[ticker], end=end, auto_adjust=True))
+
+
+def _y_chart_api(ticker, end):
+    """야후 chart API 직접 호출 (라이브러리 우회). adjclose 비율로 OHLC 조정."""
     import requests
-    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
-    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; qqq-ballast/1.0)"}, timeout=20)
-    resp.raise_for_status()
-    if "Date" not in resp.text[:50]:
-        raise RuntimeError(f"예상치 못한 응답: {resp.text[:80]!r}")
-    df = pd.read_csv(io.StringIO(resp.text), parse_dates=["Date"])
-    if df is None or df.empty or "Close" not in df.columns:
-        raise RuntimeError("빈 데이터 또는 형식 오류")
-    df = df[["Date", "Open", "High", "Low", "Close"]].dropna().sort_values("Date").reset_index(drop=True)
-    return df
+    p1 = int(pd.Timestamp(HIST_START[ticker]).timestamp())
+    p2 = int(pd.Timestamp(end).timestamp())
+    last = None
+    for host in ("query1", "query2"):
+        try:
+            r = requests.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}",
+                             params={"period1": p1, "period2": p2, "interval": "1d", "events": "div,splits"},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+            r.raise_for_status()
+            res = r.json()["chart"]["result"][0]
+            q = res["indicators"]["quote"][0]
+            adj = res["indicators"]["adjclose"][0]["adjclose"]
+            off = res["meta"].get("gmtoffset", -14400)
+            d = pd.DataFrame({"Date": pd.to_datetime(res["timestamp"], unit="s") + pd.to_timedelta(off, unit="s"),
+                              "Open": q["open"], "High": q["high"], "Low": q["low"],
+                              "Close": q["close"], "Adj": adj})
+            f = d["Adj"] / d["Close"]
+            for c in ("Open", "High", "Low", "Close"):
+                d[c] = d[c] * f
+            return _clean(d.drop(columns="Adj").set_index("Date"))
+        except Exception as e:  # noqa: BLE001
+            last = e
+    raise RuntimeError(f"chart API 실패: {last}")
+
+
+def expected_session(now_et: datetime):
+    """달력 기준 '이미 마감·확정됐어야 할' 마지막 평일 세션 (공휴일은 모름 -> 경고에만 사용)."""
+    d = now_et.date()
+    if (now_et.hour, now_et.minute) < (16, 30):
+        d = d - pd.Timedelta(days=1)
+    d = pd.Timestamp(d)
+    while d.weekday() >= 5:
+        d -= pd.Timedelta(days=1)
+    return d.date()
 
 
 def fetch_best(ticker: str, now_et: datetime):
-    """야후·stooq 둘 다 시도해서 '더 최신 날짜'인 쪽을 채택한다.
-    (야후가 에러 없이 응답했다는 것과 '최신'이라는 것은 별개 — 에러 없이 성공해도
-    하루 뒤처진 데이터를 줄 수 있어, 한쪽만 보고 "성공했으니 끝"이라 판단하면 안 된다.)
-    동률이면 야후를 우선한다(데이터 포맷이 기존과 더 일치)."""
-    candidates = []
-    try:
-        candidates.append(("yahoo", fetch_one_yahoo(ticker, now_et)))
-    except Exception as e:  # noqa: BLE001
-        print(f"[{ticker}] yahoo 실패: {e}", file=sys.stderr)
-    try:
-        candidates.append(("stooq", fetch_one_stooq(ticker)))
-    except Exception as e:  # noqa: BLE001
-        print(f"[{ticker}] stooq 실패: {e}", file=sys.stderr)
-    if not candidates:
-        raise RuntimeError(f"{ticker} 데이터를 야후/stooq 양쪽에서 모두 가져오지 못했습니다")
-    candidates.sort(key=lambda c: c[1]["Date"].iloc[-1], reverse=True)  # 최신 날짜 우선, 동률시 yahoo
-    src, df = candidates[0]
-    return df, src
+    """야후의 3가지 경로(download / Ticker.history / chart API)를 모두 시도해 가장 최신 날짜를 채택.
+    end는 '내일'로 명시(야후 end는 배타적이라 오늘 봉이 빠지는 문제 방지)."""
+    end = (pd.Timestamp(now_et.date()) + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+    cands = []
+    for name, fn in (("chart", _y_chart_api), ("download", _y_download), ("history", _y_history)):
+        try:
+            df = _trim_incomplete_bar(fn(ticker, end), now_et)
+            if df.empty:
+                raise RuntimeError("빈 데이터")
+            cands.append((name, df))
+            print(f"[{ticker}] {name}: 마지막 {df['Date'].iloc[-1].date()} 종가 {df['Close'].iloc[-1]:.2f}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[{ticker}] {name} 실패: {e}", file=sys.stderr)
+    if not cands:
+        raise RuntimeError(f"{ticker} 데이터를 가져오지 못했습니다")
+    # 최신 날짜 우선, 동률이면 download > history > chart 순서 대신 목록 앞쪽(chart) 우선하지 않고 download 우선
+    pri = {"download": 0, "history": 1, "chart": 2}
+    cands.sort(key=lambda c: (-c[1]["Date"].iloc[-1].value, pri[c[0]]))
+    return cands[0][1], cands[0][0]
 
 
-def load_from_yahoo(max_rounds: int = 3) -> dict:
-    """자산별로 야후·stooq 중 더 최신인 쪽을 채택한다(fetch_best).
-    "지금 몇 시니까 며칠 데이터가 있어야 한다"는 시계 기준 추측은 하지 않는다 — 두 소스 중
-    실제로 더 최신인 데이터를 그대로 신뢰한다. 그래도 4개 자산끼리 최신 날짜가 서로 다르면
-    (= 특정 자산만 아직 안 올라옴) 최대 max_rounds회, 5분 간격으로 전체를 다시 조회해 맞춘다.
-    끝까지 안 맞으면 경고만 남기고 공통 날짜(merge가 자동으로 더 뒤처진 자산에 맞춤)로 진행한다."""
+def load_from_yahoo(max_rounds: int = 4):
+    """4개 자산 조회. 기대 세션(달력 기준)보다 뒤처졌거나 자산 간 날짜가 다르면 2분 간격 재조회.
+    끝까지 안 맞으면 경고와 함께 진행(침묵 발송 금지). 휴장일이면 경고가 오탐일 수 있음."""
     out, src_of, dates = {}, {}, {}
 
     def fetch_round():
@@ -134,19 +152,22 @@ def load_from_yahoo(max_rounds: int = 3) -> dict:
         for a in ASSETS:
             out[a], src_of[a] = fetch_best(a, now_et)
             dates[a] = out[a]["Date"].iloc[-1].date()
+        return expected_session(now_et)
 
-    fetch_round()
-    for rnd in range(max_rounds):
-        if len(set(dates.values())) <= 1:
+    exp = fetch_round()
+    for rnd in range(max_rounds - 1):
+        if len(set(dates.values())) <= 1 and min(dates.values()) >= exp:
             break
-        print(f"자산별 최신일 불일치(라운드 {rnd + 1}/{max_rounds}): "
-              + ", ".join(f"{a}={dates[a]}" for a in ASSETS))
-        if rnd < max_rounds - 1:
-            time.sleep(300)
-            fetch_round()
-
-    print("자산별 최신 데이터: " + ", ".join(f"{a}={dates[a]}({src_of[a]})" for a in ASSETS))
+        print(f"재조회 {rnd + 1}: 기대 {exp}, " + ", ".join(f"{a}={dates[a]}" for a in ASSETS))
+        time.sleep(120)
+        exp = fetch_round()
+    print("자산별 최신 데이터: " + ", ".join(f"{a}={dates[a]}({src_of[a]})" for a in ASSETS) + f" / 기대 {exp}")
+    global EXPECTED
+    EXPECTED = exp
     return out, dates
+
+
+EXPECTED = None
 
 
 # ---------------------- 공통 지표: DI/ADX (EWM) ----------------------
@@ -531,6 +552,9 @@ def main():
         date_mismatch = ""
         if len(set(dates.values())) > 1:
             date_mismatch = "자산별 데이터 기준일 불일치: " + ", ".join(f"{a} {d}" for a, d in dates.items())
+        elif EXPECTED and min(dates.values()) < EXPECTED:
+            date_mismatch = (f"데이터 최신 아님 (기대 {EXPECTED}, 실제 {min(dates.values())}). "
+                             "휴장일이면 정상, 아니면 오늘 매매 보류 후 재실행하세요")
 
         if args.now_kst:
             now_kst = datetime.fromisoformat(args.now_kst).replace(tzinfo=KST)

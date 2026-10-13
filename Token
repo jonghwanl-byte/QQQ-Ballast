@@ -4,8 +4,7 @@
 
 GitHub
 Token name: cron-trigger
-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
-
+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
 
 https://api.github.com/repos/jonghwanl-byte/Macro/actions/workflows/macro-alert.yml/dispatches
 35 6 * * 1-6

@@ -1,0 +1,62 @@
+
+
+
+
+GitHub
+Token name: cron-trigger
+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
+
+
+https://api.github.com/repos/jonghwanl-byte/Macro/actions/workflows/macro-alert.yml/dispatches
+35 6 * * 1-6
+
+https://api.github.com/repos/jonghwanl-byte/QQQ-Ballast/actions/workflows/ballast.yml/dispatches
+36 6 * * 1-6
+
+https://api.github.com/repos/jonghwanl-byte/TAA-Satellite-Signal/actions/workflows/signal.yml/dispatches
+37 6 * * 1-6
+
+TAA-Satellite-Signal
+
+
+cron-job.org(무료)로 하는 방법입니다. 지금처럼 3시간 넘게 밀리는 건 드문 경우라, 외부 트리거로 바꾸는 것이 확실합니다.
+1단계. GitHub 토큰 만들기 (저장소 1개 전용)
+1. GitHub 우측 상단 프로필 → Settings → 맨 아래 Developer settings
+2. Personal access tokens → Fine-grained tokens → Generate new token
+3. 설정값:
+    * Token name: cron-trigger
+    * Expiration: 최대(1년). 만료되면 재발급해서 교체해야 합니다.
+    * Repository access: Only select repositories → 퀀트 저장소 하나만 선택
+    * Permissions → Repository permissions → Actions: Read and write
+4. Generate token 후 github_pat_... 값을 복사해 둡니다. 이 화면을 벗어나면 다시 볼 수 없습니다.
+2단계. yml 확인
+daily_signal.yml에 workflow_dispatch:가 있고, 기본 브랜치(보통 main)에 올라가 있으면 됩니다. 이미 있다고 하셨으니 그대로 쓰면 됩니다.
+3단계. cron-job.org 설정
+1. cron-job.org 가입(무료, 이메일 인증)
+2. Create cronjob 클릭
+3. 입력값:
+    * URL: https://api.github.com/repos/dongyoonl/저장소이름/actions/workflows/daily_signal.yml/dispatches
+    * Execution schedule: User-defined → 시간 6시 30분, 요일 월~토, 시간대 Asia/Seoul (설정에서 타임존을 먼저 맞추세요)
+4. ADVANCED 탭:
+    * Request method: POST
+    * Headers (하나씩 추가):
+◦	Key	◦	Value
+◦	Accept	◦	application/vnd.github+json
+◦	Authorization	◦	Bearer github_pat_복사한토큰
+◦	X-GitHub-Api-Version	◦	2022-11-28
+◦	Content-Type	◦	application/json
+	◦	
+    * Request body: {"ref":"main"} (기본 브랜치가 main이 아니면 해당 이름)
+1. 알림: “Notify me when the execution fails”를 켜 둡니다.
+2. Create 후 Test run을 눌러 응답이 204(성공, 본문 없음)인지 확인합니다.
+    * 401/403: 토큰이나 Actions 권한 문제
+    * 404: 저장소 이름이나 yml 파일명 오타 (비공개 저장소는 토큰 권한이 틀려도 404가 나옵니다)
+    * 422: ref 브랜치명 오류
+4단계. 확인
+Actions 탭에서 방금 실행이 workflow_dispatch로 시작됐는지, 텔레그램이 오는지 봅니다. 일반적으로 몇 초 안에 시작됩니다.
+5단계. 기존 schedule 정리
+* 중복 발송을 막으려면 daily_signal.yml의 schedule: 항목은 지우는 것이 가장 단순합니다.
+* 외부 서비스가 멈출 때를 대비해 백업을 남기려면 늦은 시각(예: 47 21 * * 0-5)으로 두고, 코드에서 "오늘 이미 보냈으면 스킵"하게 처리하세요.
+* keepalive.yml은 그대로 두셔도 됩니다.
+
+

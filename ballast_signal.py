@@ -15,6 +15,13 @@
 #   python ballast_signal.py --check --source csv --csv-dir .       # 백테스트 재현 검증
 #
 # 환경변수: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#
+# [2026-11-23 검증 메모] (상세: QQQ_Ballast_종합요약.md 6~8절)
+#   - 전략 로직은 변경하지 않음. 이 파일은 주석만 보강했고 계산 로직은 동일하다.
+#   - 데이터는 배당 포함(조정 종가) 기준이다. 야후 auto_adjust=True / chart API의 adjclose 비율 조정이 이에 해당.
+#     배당 제외 가격으로 백테스트하면 TLT 기여가 과소평가된다(TLT 제외 시 Calmar가 더 좋아 보이는 착시).
+#   - QQQ 재진입은 "+DI가 -DI보다 위에 있는 상태"(교차 아님) + 청산 후 7거래일 경과(최소 대기일).
+#   - GLD 신호는 파라미터 이웃 대비 뾰족한 봉우리(144조합 중 상위 8%). 체결 지연·비용에 취약하므로 주의.
 # =====================================================================
 import argparse
 import os
@@ -28,9 +35,17 @@ import numpy as np
 import pandas as pd
 
 # ---------------------- 전략 파라미터 (백테스트 확정값) ----------------------
+# QQQ: cooldown=7은 "청산 후 최소 7거래일 재진입 금지"(강제). 5~10일이 안정 구간이고 3일 이하/15일 이상은 MDD 악화.
+#      "종가>10일선" 재진입 확인은 QQQ 단독에선 MDD -20.3%→-18.4%였으나 위성 포함 전체 포트폴리오에선
+#      개선 없음(Calmar 0.84→0.83) → 채택하지 않음.
 QQQ_PARAMS = dict(D=180, N1=10, N2=15, frac1=0.25, di_period=14, cooldown=7, y_adx_thr=9)
+# TLT: 20/110 근처(빠른선 10~50, 느린선 60~200)는 Calmar가 평탄해 튜닝 실익 없음. 배당 포함 기준에선 위성으로서 기여가 있어 유지.
 TLT_PARAMS = dict(fast=20, slow=110)
+# GLD: 현행 유지 결정. 단, 144조합 중 상위 8%의 뾰족한 봉우리(DI 4/6/8일로 바꾸면 Calmar 0.63~0.68로 하락),
+#      연 31회 전환이라 체결 지연·비용에 취약. 대안 H1(150일선 월판정 + 고점대비 -4% 손절 + DI 재진입 + 쿨다운2)은
+#      성과가 약간 낮지만(Calmar 0.81 vs 0.85) 1일 지연 MDD가 -26.5%(현행 -30.9%)로 더 견고.
 GLD_PARAMS = dict(N=0.015, di_period=5, cooldown=2, y_adx_thr=15)
+# XLE: 쿨다운 15 이상(15~25)이 안정 구간(5~10일은 Calmar 하락). 현행 유지.
 XLE_PARAMS = dict(N=15, di_period=14, cooldown=15, y_adx_thr=15, roll_max_window=250)
 N_SAT = 3                      # C안: 위성 자산당 현금의 1/3 고정
 VOL_WINDOW = 20                # 변동성 참고 표시용(전략에는 미반영)
@@ -189,6 +204,15 @@ def di_adx(close: pd.Series, high: pd.Series, low: pd.Series, period: int):
 
 # ---------------------- QQQ 트랙2 (비중, 추적 고점, 상태) ----------------------
 def qqq_position(df, D, N1, N2, frac1, di_period, cooldown, y_adx_thr):
+    """QQQ 코어 비중 계산.
+    - 청산: 추적 고점 대비 -N1%면 frac1만 매도, -N2%면 전량 매도, ADX<y_adx_thr면 전량 매도(오신호 청산).
+    - 재진입: 청산 후 cooldown 거래일이 지났고(최소 대기일, 강제) 그날 +DI > -DI(교차가 아니라 '+DI 우위 상태')이면 전량 재진입.
+      (교차 순간만 허용하면 CAGR 11.1%/MDD -24.1%로 악화되어 상태 기준을 유지한다.)
+    - 재진입 시 추적 고점은 180일 최고가(roll_max_D)로 리셋된다. 재진입 시점이 보통 이 고점 대비 -15% 아래라
+      다음 날 바로 청산되는 '1~2일 탐색 매수'가 87회 중 67회 나타나는데, 이를 막으면(고점을 재진입일 종가로 리셋 등)
+      오히려 MDD가 악화되므로 의도된 동작으로 둔다.
+    - 체결 가정: 신호는 당일 종가 확정, 체결은 다음 거래일 시가. 체결이 1일 더 늦으면 MDD가 -20%대 중반으로 악화되는 취약점이 있다.
+    """
     close, high, low = df["Close"], df["High"], df["Low"]
     di_up, adx = di_adx(close, high, low, di_period)
     c = close.values
@@ -217,6 +241,7 @@ def qqq_position(df, D, N1, N2, frac1, di_period, cooldown, y_adx_thr):
                 days_since_exit = 0
         else:
             days_since_exit += 1
+            # 재진입: +DI 우위 '상태' + 쿨다운(최소 대기 거래일) 경과 (교차 조건 아님)
             if di_up[t] and days_since_exit >= cooldown:
                 state = 2
                 peak = roll_max_D[t]
@@ -508,7 +533,9 @@ def send_telegram(text: str):
 
 # ---------------------- 백테스트 재현 검증 ----------------------
 def check_backtest(m):
-    """저장된 목표비중을 다음날 시가에 체결한다고 보고 성과를 재계산 (문서 수치와 대조용)."""
+    """저장된 목표비중을 다음날 시가에 체결한다고 보고 성과를 재계산 (문서 수치와 대조용).
+    비용·현금이자 없음. 데이터가 배당 포함인지(조정 종가)에 따라 문서 수치와 ±0.3~0.6%p 차이날 수 있다
+    (TLT 배당 포함 시 CAGR이 더 높게 나옴). 정확한 대조는 문서와 같은 CSV로 해야 한다."""
     w = target_weights(m)
     n = len(m)
     r = np.zeros(n - 1)
@@ -524,7 +551,7 @@ def check_backtest(m):
     cagr = eq[-1] ** (1 / yrs) - 1
     mdd = (eq / np.maximum.accumulate(eq) - 1).min()
     print(f"기간 {m['Date'].iloc[0].date()} ~ {m['Date'].iloc[-1].date()} ({yrs:.1f}년)")
-    print(f"CAGR {cagr:.2%}  MDD {mdd:.2%}  Calmar {cagr / abs(mdd):.3f}   (문서 기준: 15.60% / -17.34% / 0.899, 2026-09-14까지)")
+    print(f"CAGR {cagr:.2%}  MDD {mdd:.2%}  Calmar {cagr / abs(mdd):.3f}   (문서 기준 2026-09-28: 15.60% / -17.34% / 0.899, 2026-09-14까지. 데이터 소스에 따라 오차 가능)")
 
 
 # ---------------------- main ----------------------

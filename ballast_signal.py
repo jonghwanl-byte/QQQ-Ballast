@@ -22,6 +22,9 @@
 #     배당 제외 가격으로 백테스트하면 TLT 기여가 과소평가된다(TLT 제외 시 Calmar가 더 좋아 보이는 착시).
 #   - QQQ 재진입은 "+DI가 -DI보다 위에 있는 상태"(교차 아님) + 청산 후 7거래일 경과(최소 대기일).
 #   - GLD 신호는 파라미터 이웃 대비 뾰족한 봉우리(144조합 중 상위 8%). 체결 지연·비용에 취약하므로 주의.
+#
+# [2026-11-25] 메시지 하단을 "근거(세부 지표)" 블록으로 교체(build_extra_info). 신호 로직은 그대로이고
+#   DI/ADX 값 노출용 di_adx_full을 추가했다(di_adx는 이를 호출하는 래퍼, 반환값 동일).
 # =====================================================================
 import argparse
 import os
@@ -186,7 +189,8 @@ EXPECTED = None
 
 
 # ---------------------- 공통 지표: DI/ADX (EWM) ----------------------
-def di_adx(close: pd.Series, high: pd.Series, low: pd.Series, period: int):
+def di_adx_full(close: pd.Series, high: pd.Series, low: pd.Series, period: int):
+    """+DI, -DI, ADX 값 전체(메시지 근거 표시용). 신호 계산(di_adx)과 같은 식을 쓴다."""
     up = high.diff()
     down = -low.diff()
     pdm = np.where((up > down) & (up > 0), up, 0.0)
@@ -198,6 +202,11 @@ def di_adx(close: pd.Series, high: pd.Series, low: pd.Series, period: int):
     with np.errstate(invalid="ignore"):
         dx = (np.abs(pdi - mdi) / (pdi + mdi)) * 100
     adx = pd.Series(dx).ewm(alpha=1 / period, adjust=False).mean().values
+    return pdi, mdi, adx
+
+
+def di_adx(close: pd.Series, high: pd.Series, low: pd.Series, period: int):
+    pdi, mdi, adx = di_adx_full(close, high, low, period)
     di_up = np.nan_to_num(pdi > mdi, nan=0.0).astype(bool)
     return di_up, adx
 
@@ -316,24 +325,27 @@ def build_frame(data: dict) -> pd.DataFrame:
     """각 자산 신호를 '자기 전체 이력'으로 계산한 뒤 공통 거래일로 병합."""
     q = data["QQQ"].copy()
     q["pos"], q["peak"], q["state"] = qqq_position(q, **QQQ_PARAMS)
+    q["pdi"], q["mdi"], q["adx"] = di_adx_full(q["Close"], q["High"], q["Low"], QQQ_PARAMS["di_period"])
     t = data["TLT"].copy()
     t["sig"], t["smaf"], t["smas"] = tlt_signal(t, **TLT_PARAMS)
     g = data["GLD"].copy()
     g["sig"], g["peak"] = gld_signal(g, **GLD_PARAMS)
+    g["pdi"], g["mdi"], g["adx"] = di_adx_full(g["Close"], g["High"], g["Low"], GLD_PARAMS["di_period"])
     x = data["XLE"].copy()
     x["sig"], x["peak"] = xle_signal(x, **XLE_PARAMS)
+    x["pdi"], x["mdi"], x["adx"] = di_adx_full(x["Close"], x["High"], x["Low"], XLE_PARAMS["di_period"])
 
-    ath = {a: data[a]["Close"].max() for a in ASSETS}  # 역대 최고 종가(수정종가, 데이터 시작일 이후)
+    last_dates = {a: data[a]["Date"].iloc[-1] for a in ASSETS}  # 자산별 마지막 종가 날짜(메시지 표시용)
 
     def pick(df, cols, tag):
         return df[["Date"] + cols].rename(columns={c: f"{c}_{tag}" for c in cols})
 
-    m = pick(q, ["Open", "Close", "pos", "peak", "state"], "QQQ")
+    m = pick(q, ["Open", "Close", "pos", "peak", "state", "pdi", "mdi", "adx"], "QQQ")
     m = m.merge(pick(t, ["Open", "Close", "sig", "smaf", "smas"], "TLT"), on="Date")
-    m = m.merge(pick(g, ["Open", "Close", "sig", "peak"], "GLD"), on="Date")
-    m = m.merge(pick(x, ["Open", "Close", "sig", "peak"], "XLE"), on="Date")
+    m = m.merge(pick(g, ["Open", "Close", "sig", "peak", "pdi", "mdi", "adx"], "GLD"), on="Date")
+    m = m.merge(pick(x, ["Open", "Close", "sig", "peak", "pdi", "mdi", "adx"], "XLE"), on="Date")
     m = m.sort_values("Date").reset_index(drop=True)
-    m.attrs["ath"] = ath
+    m.attrs["last_dates"] = last_dates
     return m
 
 
@@ -416,37 +428,120 @@ def build_trades(m, w):
     return [t for _, t in items], [(a, ("매도" if (a, t) in sells else "매수")) for a, t in items]
 
 
-def build_extra_info(m, w):
-    i = len(m) - 1
-    ath = m.attrs["ath"]
-    lines = []
-    for a in ASSETS:
-        c, pc = m[f"Close_{a}"].iloc[i], m[f"Close_{a}"].iloc[i - 1]
-        lines.append(a)
-        lines.append(f" 전일대비 {fmt_pct(c / pc - 1)} | 고점대비 {fmt_pct(c / ath[a] - 1)}")
-        held = w[a][i] > 1e-9
-        if not held:
-            continue
-        if a == "QQQ":
-            state = int(m["state_QQQ"].iloc[i])
-            n_pct = QQQ_PARAMS["N1"] if state == 2 else QQQ_PARAMS["N2"]
-            dd = (c / m["peak_QQQ"].iloc[i] - 1) * 100
-            gap = n_pct + dd
-            label = "1차 손절선" if state == 2 else "손절선"
-            if gap <= 0:
-                lines.append(f" {label}(-{n_pct}%) 이미 초과 ({-gap:.1f}%p) — 다음 종가 기준 매도 신호 가능")
-            else:
-                lines.append(f" {label}(-{n_pct}%)까지 {gap:.1f}% 남음")
-        elif a == "TLT":
-            spread = (m["smaf_TLT"].iloc[i] / m["smas_TLT"].iloc[i] - 1) * 100
-            lines.append(f" 데드크로스까지 SMA 격차 {spread:+.1f}%")
+# 임박 표시 기준 (표시 전용, 전략 로직과 무관)
+IMM_STOP_FRAC = 0.2   # 손절선까지 남은 거리가 손절폭의 20% 이내
+IMM_ADX = 2.0         # ADX가 청산선(Y)에서 2.0 이내
+IMM_TLT = 0.3         # TLT SMA 격차 절대값 0.3% 이내
+IMM_DI = 3.0          # 재진입 DI 격차 3.0 이내
+WARN = "⚠️ 임박"
+
+
+def _zero_days(sig) -> int:
+    """끝에서부터 연속 0(청산) 일수. 청산한 날을 1로 센다."""
+    k = 0
+    for v in sig[::-1]:
+        if v == 0:
+            k += 1
         else:
-            n_pct = GLD_PARAMS["N"] * 100 if a == "GLD" else XLE_PARAMS["N"]
-            dd = (c / m[f"peak_{a}"].iloc[i] - 1) * 100
-            gap = n_pct + dd
-            n_txt = f"{n_pct:.1f}".rstrip("0").rstrip(".")
-            lines.append(f" 손절선(-{n_txt}%)까지 {gap:.1f}% 남음")
-    return "\n".join(lines)
+            break
+    return k
+
+
+def _pct(x: float) -> str:
+    return f"{x * 100:+.1f}%"
+
+
+def _d(a: float, b: float, nd: int = 1) -> str:
+    """전일 값 표기: (전일 b)"""
+    return f"(전일 {b:.{nd}f})"
+
+
+def _reentry_lines(m, a, i, sig, need, cd_name):
+    """청산 상태 자산의 재진입 조건 체크리스트. need = 재진입에 필요한 경과 거래일."""
+    k = _zero_days(sig[: i + 1]) - 1          # 청산일 = 0일째
+    cd_ok = k >= need
+    p1, m1 = m[f"pdi_{a}"].iloc[i], m[f"mdi_{a}"].iloc[i]
+    p0, m0 = m[f"pdi_{a}"].iloc[i - 1], m[f"mdi_{a}"].iloc[i - 1]
+    di_ok = p1 > m1
+    adx1, adx0 = m[f"adx_{a}"].iloc[i], m[f"adx_{a}"].iloc[i - 1]
+    lines = [
+        f" 재진입 ① 쿨다운: 경과 {k}일 / 필요 {need}일 {'✔' if cd_ok else '✘'}",
+        f" 재진입 ② +DI>-DI: {p1:.1f} vs {m1:.1f} {'✔' if di_ok else '✘'} (전일 {p0:.1f} vs {m0:.1f})",
+        f" ADX {adx1:.1f} {_d(adx1, adx0)}",
+    ]
+    near_cd = (not cd_ok) and (need - k) <= 1
+    near_di = (not di_ok) and (m1 - p1) <= IMM_DI
+    if (cd_ok and near_di) or (di_ok and near_cd) or (near_cd and near_di):
+        lines[1] += f"  {WARN}"
+    return lines
+
+
+def _hold_lines(m, a, i, stop_pct, y_thr, state_label=None):
+    """보유 상태 자산: 고점 대비, 손절선까지 거리, ADX 여유."""
+    c, pk = m[f"Close_{a}"].iloc[i], m[f"peak_{a}"].iloc[i]
+    cp, pkp = m[f"Close_{a}"].iloc[i - 1], m[f"peak_{a}"].iloc[i - 1]
+    dd = c / pk - 1
+    dd_prev = (cp / pkp - 1) if not np.isnan(pkp) else None
+    gap = stop_pct + dd * 100
+    lines = [f" 추적고점 대비 {_pct(dd)}" + (f" (전일 {_pct(dd_prev)})" if dd_prev is not None else "")]
+    near = gap <= stop_pct * IMM_STOP_FRAC
+    tag = f"  {WARN}" if near else ""
+    lines.append(f" {state_label or '손절'}(-{stop_pct:g}%)까지 {gap:.1f}%p{tag}")
+    adx1, adx0 = m[f"adx_{a}"].iloc[i], m[f"adx_{a}"].iloc[i - 1]
+    room = adx1 - y_thr
+    tag = f"  {WARN}" if room <= IMM_ADX else ""
+    lines.append(f" ADX {adx1:.1f} {_d(adx1, adx0)} / 청산선({y_thr})까지 {room:.1f}{tag}")
+    return lines
+
+
+def build_extra_info(m, w):
+    """근거(세부 지표) 블록. 신호 계산에 쓴 값을 그대로 꺼내 보여준다(별도 재계산 없음)."""
+    i = len(m) - 1
+    ld = m.attrs["last_dates"]
+    out = []
+
+    def head(a, status):
+        c, pc = m[f"Close_{a}"].iloc[i], m[f"Close_{a}"].iloc[i - 1]
+        d0 = m["Date"].iloc[i]
+        warn = f"  ⚠️ 원자료 마지막 날짜 {ld[a]:%m-%d}" if ld[a] != d0 else ""
+        return [f"【{a}】 {status}", f" {d0:%m-%d} 종가 {c:,.2f} ({fmt_pct(c / pc - 1)}){warn}"]
+
+    # QQQ
+    state = int(m["state_QQQ"].iloc[i])
+    L = head("QQQ", f"ON · 비중 {fmt_w(w['QQQ'][i])}" if state > 0 else "OFF")
+    if state > 0:
+        n = QQQ_PARAMS["N1"] if state == 2 else QQQ_PARAMS["N2"]
+        label = "1차 손절" if state == 2 else "최종 손절"
+        L += _hold_lines(m, "QQQ", i, n, QQQ_PARAMS["y_adx_thr"], label)
+    else:
+        L += _reentry_lines(m, "QQQ", i, m["state_QQQ"].values, QQQ_PARAMS["cooldown"], "QQQ")
+    out.append("\n".join(L))
+
+    # TLT
+    sig = int(m["sig_TLT"].iloc[i])
+    L = head("TLT", f"ON · 비중 {fmt_w(w['TLT'][i])}" if sig else "OFF")
+    f1, s1 = m["smaf_TLT"].iloc[i], m["smas_TLT"].iloc[i]
+    f0, s0 = m["smaf_TLT"].iloc[i - 1], m["smas_TLT"].iloc[i - 1]
+    g1, g0 = (f1 / s1 - 1) * 100, (f0 / s0 - 1) * 100
+    L.append(f" SMA{TLT_PARAMS['fast']} {f1:.2f} / SMA{TLT_PARAMS['slow']} {s1:.2f}")
+    tag = f"  {WARN}" if abs(g1) <= IMM_TLT else ""
+    target = "데드크로스" if sig else "골든크로스"
+    dg = g1 - g0
+    dg_txt = "변화 없음" if abs(dg) < 0.005 else f"{dg:+.2f}%p"
+    L.append(f" 격차 {g1:+.2f}% (전일 {g0:+.2f}%, {dg_txt}) → {target}까지 {abs(g1):.2f}%p{tag}")
+    out.append("\n".join(L))
+
+    # GLD, XLE
+    for a, P, stop, need in (("GLD", GLD_PARAMS, GLD_PARAMS["N"] * 100, GLD_PARAMS["cooldown"] + 1),
+                             ("XLE", XLE_PARAMS, XLE_PARAMS["N"], XLE_PARAMS["cooldown"])):
+        sig = int(m[f"sig_{a}"].iloc[i])
+        L = head(a, f"ON · 비중 {fmt_w(w[a][i])}" if sig else "OFF")
+        if sig:
+            L += _hold_lines(m, a, i, stop, P["y_adx_thr"])
+        else:
+            L += _reentry_lines(m, a, i, m[f"sig_{a}"].values, need, a)
+        out.append("\n".join(L))
+    return "\n\n".join(out)
 
 
 def build_sat_change(m):
@@ -497,7 +592,7 @@ def build_message(m, now_kst: datetime, date_mismatch: str = "") -> str:
     out.append("──────────────")
     out.append("")
 
-    out += ["━━━ 부가 정보 ━━━", build_extra_info(m, w)]
+    out += ["━━━ 근거 (세부 지표) ━━━", build_extra_info(m, w)]
 
     sat = build_sat_change(m)
     if sat:
